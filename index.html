@@ -566,7 +566,10 @@ canvas.spark{display:block;}
 
         <div style="display:flex;flex-direction:column;gap:7px;">
           <button class="btn-run" onclick="runScreen()">🔍 開始篩選</button>
-          <button class="btn-reset" onclick="resetScreen()">重置所有條件</button>
+          <div style="display:flex;gap:7px;">
+            <button class="btn-reset" style="flex:1;" onclick="resetScreen()">重置條件</button>
+            <button class="btn-reset" style="flex:1;" onclick="refreshScreenerData()" title="重新從 FinMind 拉取最新資料">🔄 更新資料</button>
+          </div>
         </div>
       </aside>
 
@@ -1024,16 +1027,66 @@ function passCustom(s) {
   return true;
 }
 
-function runScreen() {
-  const results = STOCKS.filter(s => {
-    const hits = GURUS.filter(g=>activeGurus.has(g.key)&&guruPass[g.key](s)).map(g=>g.key);
+// ── 篩選器狀態 ───────────────────────────────────────────────────
+let _screenerCache = null;      // 快取從 API 拿回的資料
+let _screenerLoading = false;   // 防止重複呼叫
+
+async function runScreen() {
+  // 顯示 loading 狀態
+  document.getElementById('s-emptyState').style.display = '';
+  document.getElementById('s-emptyState').innerHTML = `
+    <div class="empty-icon">⏳</div>
+    <div class="empty-title">資料載入中，請稍候…</div>
+    <div class="empty-sub" id="s-loadingHint">正在從 FinMind 拉取全市場財務資料（首次約 10~20 秒）</div>`;
+  document.getElementById('s-resultBody').innerHTML = '';
+  document.getElementById('s-summaryBar').style.display = 'none';
+
+  let universe = _screenerCache;
+
+  // 若無快取，從 API 取得
+  if (!universe) {
+    if (_screenerLoading) return;
+    _screenerLoading = true;
+    try {
+      const res = await fetch(`${API_BASE}/api/screener`);
+      const data = await res.json();
+
+      if (data.mock) {
+        // Token 未設定或 API 出錯，用 mock 資料
+        universe = data.stocks;
+        document.getElementById('s-loadingHint') &&
+          (document.getElementById('s-loadingHint').textContent =
+            '⚠️ 使用示範資料（FinMind Token 未設定或 API 暫時無法連線）');
+      } else {
+        universe = data.stocks;
+        _screenerCache = universe; // 快取
+        console.log(`[Screener] 載入 ${universe.length} 檔股票`);
+      }
+    } catch (err) {
+      console.warn('[Screener] API failed, using static STOCKS:', err.message);
+      universe = STOCKS; // 最終備援：用靜態資料
+    } finally {
+      _screenerLoading = false;
+    }
+  }
+
+  // 套用篩選條件
+  const results = universe.filter(s => {
+    const hits = GURUS.filter(g => activeGurus.has(g.key) && guruPass[g.key](s)).map(g => g.key);
     s._hits = hits;
-    const passG = activeGurus.size===0 || hits.length>0;
+    const passG = activeGurus.size === 0 || hits.length > 0;
     return passG && passCustom(s);
   });
+
   sCurrentData = results;
   sApplySort();
   updateSummary(results);
+}
+
+// 強制重新拉資料（清除快取）
+async function refreshScreenerData() {
+  _screenerCache = null;
+  await runScreen();
 }
 
 function updateSummary(results) {
