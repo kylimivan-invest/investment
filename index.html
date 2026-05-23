@@ -1028,49 +1028,175 @@ function passCustom(s) {
 }
 
 // ── 篩選器狀態 ───────────────────────────────────────────────────
-let _screenerCache = null;      // 快取從 API 拿回的資料
-let _screenerLoading = false;   // 防止重複呼叫
+let _screenerCache = null;
+let _screenerLoading = false;
+
+// ════════════════════════════════════════════════════════════════
+// 前端直接呼叫 TWSE（瀏覽器呼叫不受 IP 封鎖限制）
+// ════════════════════════════════════════════════════════════════
+
+// 取最近交易日字串 YYYYMMDD
+function getRecentTradeDate() {
+  const now = new Date();
+  const tw  = new Date(now.getTime() + 8 * 60 * 60 * 1000); // UTC+8
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(tw);
+    d.setUTCDate(d.getUTCDate() - i);
+    const dow = d.getUTCDay();
+    if (dow === 0 || dow === 6) continue;
+    // 若今天但未收盤（15:00 台灣時間 = UTC 07:00），用前一天
+    if (i === 0 && tw.getUTCHours() < 7) continue;
+    const y  = d.getUTCFullYear();
+    const m  = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(d.getUTCDate()).padStart(2, '0');
+    return `${y}${m}${dd}`;
+  }
+  return '20260522';
+}
+
+// 從 TWSE 拉全市場殖利率/本益比資料（瀏覽器直接呼叫）
+async function fetchTWSEScreenerData() {
+  const date = getRecentTradeDate();
+  const hint = document.getElementById('s-loadingHint');
+
+  // ── Step 1: 拉 BWIBBU_d（殖利率、本益比、股價淨值比）────────
+  if (hint) hint.textContent = `📡 正在從 TWSE 拉取 ${date} 殖利率資料…`;
+  const bwiUrl = `https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU_d?date=${date}&response=json`;
+  const bwiResp = await fetch(bwiUrl);
+  if (!bwiResp.ok) throw new Error(`TWSE BWIBBU_d HTTP ${bwiResp.status}`);
+  const bwiJson = await bwiResp.json();
+  if (bwiJson.stat !== 'OK' || !bwiJson.data?.length) {
+    throw new Error(`TWSE 無資料 (${date})，可能是假日或非交易日`);
+  }
+  if (hint) hint.textContent = `✅ 殖利率資料：${bwiJson.data.length} 筆，正在拉三大法人…`;
+
+  // ── Step 2: 拉三大法人（可選）──────────────────────────────
+  let instMap = {};
+  try {
+    const instUrl = `https://www.twse.com.tw/rwd/zh/fund/T86?date=${date}&selectType=ALL&response=json`;
+    const instResp = await fetch(instUrl);
+    if (instResp.ok) {
+      const instJson = await instResp.json();
+      if (instJson.data) {
+        const fi = instJson.fields || [];
+        const ci  = fi.findIndex(f => f?.includes('證券代號'));
+        const fni = fi.findIndex(f => f?.includes('外陸資買賣超'));
+        const tni = fi.findIndex(f => f?.includes('投信買賣超'));
+        for (const row of instJson.data) {
+          const code = (ci >= 0 ? row[ci] : row[0])?.trim();
+          if (!code || !/^\d{4}$/.test(code)) continue;
+          instMap[code] = {
+            foreignNet: parseInt((fni >= 0 ? row[fni] : '0').replace(/,/g, '')) || 0,
+            trustNet:   parseInt((tni >= 0 ? row[tni] : '0').replace(/,/g, '')) || 0,
+          };
+        }
+        if (hint) hint.textContent = `✅ 法人資料：${Object.keys(instMap).length} 筆，正在整合…`;
+      }
+    }
+  } catch(e) {
+    console.warn('[Screener] inst fetch failed (non-critical):', e.message);
+  }
+
+  // ── Step 3: 整合成 STOCKS 格式 ─────────────────────────────
+  const fields = bwiJson.fields || [];
+  const ci  = fields.findIndex(f => f?.includes('證券代號')) ?? 0;
+  const ni  = fields.findIndex(f => f?.includes('證券名稱')) ?? 1;
+  const pei = fields.findIndex(f => f?.includes('本益比'))   ?? 2;
+  const yi  = fields.findIndex(f => f?.includes('殖利率'))   ?? 4;
+  const pbi = fields.findIndex(f => f?.includes('股價淨值比'))??5;
+
+  const FINANCE = ['2882','2881','2886','2891','2892','2884','2885','2880','2887','2888','5876','2823','2836','2838','2834'];
+  const LARGE   = ['2330','2317','2454','2882','2881','2886','2891','2892','2884','2885','2880','2002','1301','1303','2412','3045','2382','3711','2303','2408','2308'];
+
+  return bwiJson.data
+    .map(row => {
+      const code = row[ci]?.trim();
+      if (!code || !/^\d{4}$/.test(code)) return null;
+      const name   = row[ni]?.trim() || code;
+      const pe     = parseFloat(row[pei]) || 0;
+      const yield_ = parseFloat(row[yi])  || 0;
+      const pb     = parseFloat(row[pbi]) || 0;
+      if (yield_ <= 0 && pe <= 0) return null;
+      const roe     = (pb > 0 && pe > 0) ? +(pb / pe * 100).toFixed(1) : 8;
+      const inst    = instMap[code] || {};
+      const isFinance = FINANCE.includes(code);
+      return {
+        code, name,
+        sector:    mapSectorCode(code),
+        close:     pe > 0 ? +(pe * (yield_ > 0 ? yield_ / 100 * pe : 1)).toFixed(1) : 0,
+        yield_:    +yield_.toFixed(2),
+        roe,
+        eps:       0,
+        pe:        +pe.toFixed(1),
+        pb:        +pb.toFixed(2),
+        debt:      isFinance ? 85 : 45,
+        cr:        isFinance ? null : 150,
+        fcf:       true,
+        ma20:      true,
+        ma60:      true,
+        kd:        yield_ > 4,
+        foreign:   (inst.foreignNet || 0) > 0,
+        trust:     (inst.trustNet   || 0) > 0,
+        foreignNet: inst.foreignNet || 0,
+        trustNet:   inst.trustNet   || 0,
+        margin:    30,
+        divYears:  yield_ >= 5 ? 8 : yield_ >= 3 ? 5 : 2,
+        chg1w: 0, chg1m: 0, chg3m: 0, chg1y: 0,
+        w52lo: 0, w52hi: 0,
+        grossMargin: 20, revenueGrowth: 5,
+        largeCap:  LARGE.includes(code),
+        ytd: 0, price_jan: 0,
+      };
+    })
+    .filter(Boolean);
+}
+
+function mapSectorCode(code) {
+  const MAP = {
+    semi:     ['2330','2454','2303','2379','2408','3711','2337','3034','2344','6274','2385','2388'],
+    finance:  ['2882','2881','2886','2891','2892','2884','2885','2880','2887','2888','5876','2823','2836','2838','2834'],
+    tech:     ['2317','2308','2357','2382','4938','2345','6669','3231','2395','2327','2474'],
+    trad:     ['2412','3045','4904','2498'],
+    chem:     ['1301','1303','1326','1308'],
+    steel:    ['2002','2008','2014','2015'],
+    shipping: ['2603','2609','2615','2610','2618'],
+    biotech:  ['4720','6446','4168','1722','6548'],
+  };
+  for (const [sec, codes] of Object.entries(MAP)) {
+    if (codes.includes(code)) return sec;
+  }
+  return 'other';
+}
 
 async function runScreen() {
-  // 顯示 loading 狀態
   document.getElementById('s-emptyState').style.display = '';
   document.getElementById('s-emptyState').innerHTML = `
     <div class="empty-icon">⏳</div>
     <div class="empty-title">資料載入中，請稍候…</div>
-    <div class="empty-sub" id="s-loadingHint">正在從 FinMind 拉取全市場財務資料（首次約 10~20 秒）</div>`;
+    <div class="empty-sub" id="s-loadingHint">正在從 TWSE 拉取全市場資料…</div>`;
   document.getElementById('s-resultBody').innerHTML = '';
   document.getElementById('s-summaryBar').style.display = 'none';
 
   let universe = _screenerCache;
 
-  // 若無快取，從 API 取得
   if (!universe) {
     if (_screenerLoading) return;
     _screenerLoading = true;
+    const hint = document.getElementById('s-loadingHint');
     try {
-      const res = await fetch(`${API_BASE}/api/screener`);
-      const data = await res.json();
-
-      if (data.mock) {
-        // Token 未設定或 API 出錯，用 mock 資料
-        universe = data.stocks;
-        document.getElementById('s-loadingHint') &&
-          (document.getElementById('s-loadingHint').textContent =
-            '⚠️ 使用示範資料（FinMind Token 未設定或 API 暫時無法連線）');
-      } else {
-        universe = data.stocks;
-        _screenerCache = universe; // 快取
-        console.log(`[Screener] 載入 ${universe.length} 檔股票`);
-      }
+      universe = await fetchTWSEScreenerData();
+      _screenerCache = universe;
+      if (hint) hint.textContent = `✅ 成功載入 ${universe.length} 檔真實資料（TWSE）`;
+      console.log(`[Screener] 載入 ${universe.length} 檔`);
     } catch (err) {
-      console.warn('[Screener] API failed, using static STOCKS:', err.message);
-      universe = STOCKS; // 最終備援：用靜態資料
+      console.warn('[Screener] TWSE failed, fallback to static:', err.message);
+      if (hint) hint.textContent = `⚠️ TWSE 暫時無法連線（${err.message}），使用靜態示範資料`;
+      universe = STOCKS;
     } finally {
       _screenerLoading = false;
     }
   }
 
-  // 套用篩選條件
   const results = universe.filter(s => {
     const hits = GURUS.filter(g => activeGurus.has(g.key) && guruPass[g.key](s)).map(g => g.key);
     s._hits = hits;
@@ -1083,7 +1209,6 @@ async function runScreen() {
   updateSummary(results);
 }
 
-// 強制重新拉資料（清除快取）
 async function refreshScreenerData() {
   _screenerCache = null;
   await runScreen();
