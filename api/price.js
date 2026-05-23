@@ -18,7 +18,11 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Methods', 'GET');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  const { code, codes } = req.query;
+  // 使用 URL API 取代已棄用的 url.parse()
+  const baseUrl = `https://${req.headers.host}`;
+  const { searchParams } = new URL(req.url, baseUrl);
+  const code  = searchParams.get('code');
+  const codes = searchParams.get('codes');
 
   // 支援單筆或批次
   const codeList = codes
