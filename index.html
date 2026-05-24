@@ -1035,8 +1035,8 @@ async function runScreen() {
   document.getElementById('s-emptyState').style.display = '';
   document.getElementById('s-emptyState').innerHTML = `
     <div class="empty-icon">⏳</div>
-    <div class="empty-title">資料載入中，請稍候…</div>
-    <div class="empty-sub" id="s-loadingHint">正在從 TWSE 拉取全市場資料（約 5 秒）…</div>`;
+    <div class="empty-title">資料載入中…</div>
+    <div class="empty-sub" id="s-loadingHint">正在讀取股票資料庫…</div>`;
   document.getElementById('s-resultBody').innerHTML = '';
   document.getElementById('s-summaryBar').style.display = 'none';
 
@@ -1047,21 +1047,41 @@ async function runScreen() {
     _screenerLoading = true;
     const hint = document.getElementById('s-loadingHint');
     try {
-      const res  = await fetch(`${API_BASE}/api/screener`);
+      // 從靜態 JSON 讀取（不受 IP 封鎖，速度超快）
+      const res  = await fetch(`${API_BASE}/data/stocks.json`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      console.log('[Screener]', { mock: data.mock, count: data.count, error: data.error });
+      universe = data.stocks;
+      _screenerCache = universe;
 
-      if (data.mock) {
-        universe = data.stocks;
-        if (hint) hint.innerHTML = `⚠️ 使用示範資料（${data.error || ''}）`;
-      } else {
-        universe = data.stocks;
-        _screenerCache = universe;
-        if (hint) hint.textContent = `✅ 成功載入 ${universe.length} 檔真實資料（TWSE）`;
-      }
+      // 用 /api/price 補上即時收盤價
+      if (hint) hint.textContent = `✅ 載入 ${universe.length} 檔，補充即時股價中…`;
+      try {
+        const codes = universe.slice(0,50).map(s=>s.code).join(',');
+        const pr = await fetch(`${API_BASE}/api/price?codes=${codes}`);
+        if (pr.ok) {
+          const prices = await pr.json();
+          if (Array.isArray(prices)) {
+            const pm = {};
+            prices.forEach(p => { if(p.code) pm[p.code]=p; });
+            universe.forEach(s => {
+              if (pm[s.code]) {
+                s.close    = pm[s.code].close    ?? s.close;
+                s.chg1w    = pm[s.code].changePct ?? 0;
+                s.chg1m    = pm[s.code].changePct ?? 0;
+                s.w52hi    = pm[s.code].high      ?? 0;
+                s.w52lo    = pm[s.code].low       ?? 0;
+              }
+            });
+          }
+        }
+      } catch(e) { console.warn('[Screener] price enrichment skip:', e.message); }
+
+      if (hint) hint.textContent = `✅ 成功載入 ${universe.length} 檔（${data.updated}）`;
+      console.log(`[Screener] ${universe.length} stocks from ${data.source}`);
     } catch (err) {
-      console.warn('[Screener] fallback to static:', err.message);
-      if (hint) hint.textContent = `⚠️ 連線失敗，使用靜態示範資料`;
+      console.warn('[Screener] fallback to static STOCKS:', err.message);
+      if (hint) hint.textContent = `⚠️ 讀取失敗，使用靜態示範資料`;
       universe = STOCKS;
     } finally {
       _screenerLoading = false;
