@@ -1048,17 +1048,22 @@ async function runScreen() {
     const hint = document.getElementById('s-loadingHint');
     try {
       // 從靜態 JSON 讀取（不受 IP 封鎖，速度超快）
-      const res  = await fetch(`${API_BASE}/data/stocks.json`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (hint) hint.textContent = '正在讀取 data/stocks.json…';
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000); // 8秒 timeout
+      const res = await fetch(`${API_BASE}/data/stocks.json`, { signal: controller.signal });
+      clearTimeout(timeout);
+      if (!res.ok) throw new Error(`HTTP ${res.status} - data/stocks.json 不存在`);
       const data = await res.json();
       universe = data.stocks;
       _screenerCache = universe;
-
-      // 用 /api/price 補上即時收盤價
       if (hint) hint.textContent = `✅ 載入 ${universe.length} 檔，補充即時股價中…`;
       try {
         const codes = universe.slice(0,50).map(s=>s.code).join(',');
-        const pr = await fetch(`${API_BASE}/api/price?codes=${codes}`);
+        const pc = new AbortController();
+        const pt = setTimeout(() => pc.abort(), 5000);
+        const pr = await fetch(`${API_BASE}/api/price?codes=${codes}`, { signal: pc.signal });
+        clearTimeout(pt);
         if (pr.ok) {
           const prices = await pr.json();
           if (Array.isArray(prices)) {
