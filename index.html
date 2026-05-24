@@ -1100,6 +1100,20 @@ async function runScreen() {
     return passG && passCustom(s);
   });
 
+  console.log(`[Screener] activeGurus=${[...activeGurus]} results=${results.length} universe=${universe.length}`);
+  if (results.length === 0 && universe.length > 0) {
+    // 診斷：各條件分別篩幾檔
+    const sample = universe.slice(0,5);
+    console.log('[Screener] sample stocks:', sample.map(s=>({code:s.code,yield_:s.yield_,roe:s.roe,eps:s.eps,ma20:s.ma20,ma60:s.ma60,kd:s.kd})));
+    console.log('[Screener] passCustom sample:', sample.map(s=>passCustom(s)));
+    if (activeGurus.size > 0) {
+      GURUS.filter(g=>activeGurus.has(g.key)).forEach(g => {
+        const n = universe.filter(s=>guruPass[g.key](s)).length;
+        console.log(`[Screener] ${g.name} passes: ${n}`);
+      });
+    }
+  }
+
   sCurrentData = results;
   sApplySort();
   updateSummary(results);
