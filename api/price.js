@@ -1,159 +1,132 @@
 /**
  * api/price.js
- * 即時/收盤股價 API
- * 資料來源：TWSE（台灣證券交易所）公開 API，免 Token
+ * 台股即時/快照股價 API（上市 TSE + 上櫃 OTC，免 Token）
+ * 資料來源：TWSE MIS 即時行情端點，批次抓取
  *
- * 呼叫方式：
+ * 設計重點（快照式）：
+ *   1. 一次請求用 "|" 串接多檔，減少對 TWSE 的呼叫次數
+ *   2. 自動判斷上市/上櫃：先以 tse_ 批次抓，未命中者再以 otc_ 重試
+ *   3. 單檔失敗不會讓整批 500（逐批 try/catch，最後一律回 200）
+ *   4. 收盤後 z='-' 時，依 pz(前次成交) → y(昨收) 取值
+ *   5. 邊緣快取（見 vercel.json）：所有使用者共用快照
+ *
+ * 呼叫：
  *   GET /api/price?code=2330
- *   GET /api/price?codes=2330,2454,2882   (批次，逗號分隔)
- *
- * 回傳格式：
- *   單支: { code, name, close, open, high, low, volume, change, changePct, date }
- *   批次: [ { ...同上 }, ... ]
+ *   GET /api/price?codes=2330,5011,00878   （上市上櫃可混）
  */
 
+const MIS = 'https://mis.twse.com.tw/stock/api/getStockInfo.jsp';
+const BATCH_SIZE = 40;
+
 export default async function handler(req, res) {
-  // ── CORS ──────────────────────────────────────────────────────────
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET');
+  res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=300');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  // 使用 URL API 取代已棄用的 url.parse()
-  const baseUrl = `https://${req.headers.host}`;
-  const { searchParams } = new URL(req.url, baseUrl);
-  const code  = searchParams.get('code');
-  const codes = searchParams.get('codes');
+  const base = `https://${req.headers.host || 'localhost'}`;
+  const { searchParams } = new URL(req.url, base);
+  const raw = searchParams.get('codes') || searchParams.get('code') || '';
+  const codes = raw.split(',').map((c) => c.trim()).filter(Boolean);
 
-  // 支援單筆或批次
-  const codeList = codes
-    ? codes.split(',').map(c => c.trim()).filter(Boolean)
-    : code
-      ? [code.trim()]
-      : [];
-
-  if (codeList.length === 0) {
+  if (codes.length === 0) {
     return res.status(400).json({ error: '請提供 code 或 codes 參數' });
   }
 
   try {
-    const results = await Promise.all(codeList.map(fetchStockPrice));
-
-    // 單筆直接回傳物件，批次回傳陣列
-    if (codeList.length === 1) {
-      return res.status(200).json(results[0]);
-    }
-    return res.status(200).json(results);
+    const map = await fetchSnapshot(codes);
+    const out = codes.map((c) => map[c] || { code: c, error: 'no_data' });
+    return res.status(200).json(out.length === 1 ? out[0] : out);
   } catch (err) {
     console.error('[price.js] Error:', err.message);
-    return res.status(500).json({ error: err.message });
+    const fb = codes.map((c) => ({ code: c, error: err.message }));
+    return res.status(200).json(fb.length === 1 ? fb[0] : fb);
   }
 }
 
-/**
- * 從 TWSE 取得個股即時/收盤資料
- * TWSE 公開端點，不需要 API Key
- */
-async function fetchStockPrice(code) {
-  // TWSE 個股即時行情（盤中及收盤後均可用）
-  const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_${code}.tw&json=1&delay=0`;
+function chunk(arr, n) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+  return out;
+}
 
-  const resp = await fetch(url, {
+function num(v) {
+  const n = parseFloat(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+async function misBatch(exChs) {
+  const url = `${MIS}?ex_ch=${exChs.join('|')}&json=1&delay=0&_=${Date.now()}`;
+  const opts = {
     headers: {
-      'User-Agent': 'Mozilla/5.0 (compatible; TWSEDashboard/1.0)',
-      'Referer': 'https://mis.twse.com.tw/',
+      'User-Agent': 'Mozilla/5.0 (compatible; TWSEDashboard/2.0)',
+      Referer: 'https://mis.twse.com.tw/stock/index.html',
     },
-  });
+  };
+  let resp = await fetch(url, opts);
+  if (!resp.ok) throw new Error(`MIS request failed: ${resp.status}`);
+  let data = await resp.json();
+  let arr = data && data.msgArray;
+  if (!arr || arr.length === 0) {
+    await new Promise((r) => setTimeout(r, 300));
+    resp = await fetch(`${url}&r=2`, opts);
+    if (resp.ok) {
+      data = await resp.json();
+      arr = (data && data.msgArray) || [];
+    } else {
+      arr = [];
+    }
+  }
+  return arr || [];
+}
 
-  if (!resp.ok) {
-    throw new Error(`TWSE request failed for ${code}: ${resp.status}`);
+async function fetchSnapshot(codes) {
+  const result = {};
+
+  for (const grp of chunk(codes, BATCH_SIZE)) {
+    try {
+      const arr = await misBatch(grp.map((c) => `tse_${c}.tw`));
+      arr.forEach((s) => addRow(result, s));
+    } catch (e) {
+      console.warn('[price.js] tse batch skip:', e.message);
+    }
   }
 
-  const data = await resp.json();
-  const msgArray = data?.msgArray;
-
-  if (!msgArray || msgArray.length === 0) {
-    // 非交易時間可能無即時資料，改用歷史收盤
-    return await fetchClosingPrice(code);
+  const missing = codes.filter((c) => !result[c]);
+  for (const grp of chunk(missing, BATCH_SIZE)) {
+    try {
+      const arr = await misBatch(grp.map((c) => `otc_${c}.tw`));
+      arr.forEach((s) => addRow(result, s));
+    } catch (e) {
+      console.warn('[price.js] otc batch skip:', e.message);
+    }
   }
 
-  const s = msgArray[0];
+  return result;
+}
 
-  // TWSE 欄位說明：
-  // n  = 股票名稱
-  // z  = 最新成交價 (盤中) or 收盤價
-  // o  = 開盤價
-  // h  = 最高價
-  // l  = 最低價
-  // v  = 成交量（張）
-  // y  = 昨收
-  // d  = 日期 (YYYYMMDD)
-  const close = parseFloat(s.z) || parseFloat(s.y);
-  const prevClose = parseFloat(s.y);
-  const change = close - prevClose;
-  const changePct = prevClose > 0 ? (change / prevClose * 100) : 0;
+function addRow(result, s) {
+  const code = s.c;
+  if (!code) return;
 
-  return {
+  const last = num(s.z) ?? num(s.pz) ?? num(s.y);
+  const prev = num(s.y);
+  const change = last != null && prev != null ? +(last - prev).toFixed(2) : null;
+  const changePct = change != null && prev > 0 ? +((change / prev) * 100).toFixed(2) : null;
+
+  result[code] = {
     code,
     name: s.n || code,
-    close: close,
-    open: parseFloat(s.o) || null,
-    high: parseFloat(s.h) || null,
-    low: parseFloat(s.l) || null,
-    volume: parseInt(s.v) || null,
-    prevClose,
-    change: +change.toFixed(2),
-    changePct: +changePct.toFixed(2),
+    close: last,
+    open: num(s.o),
+    high: num(s.h),
+    low: num(s.l),
+    prevClose: prev,
+    volume: num(s.v),
+    change,
+    changePct,
     date: s.d || null,
-    source: 'twse_realtime',
-  };
-}
-
-/**
- * 備援：使用 TWSE 歷史日成交資料取得最近收盤價
- * 在非交易日或盤後使用
- */
-async function fetchClosingPrice(code) {
-  // 取近一個月資料，拿最後一筆
-  const today = new Date();
-  const yyyymm = `${today.getFullYear()}${String(today.getMonth() + 1).padStart(2, '0')}`;
-
-  const url = `https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY?stockNo=${code}&date=${yyyymm}01&response=json`;
-
-  const resp = await fetch(url, {
-    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TWSEDashboard/1.0)' },
-  });
-
-  if (!resp.ok) throw new Error(`TWSE history fallback failed for ${code}`);
-
-  const data = await resp.json();
-  const rows = data?.data;
-
-  if (!rows || rows.length === 0) {
-    throw new Error(`No price data found for ${code}`);
-  }
-
-  // 最後一筆為最近交易日
-  // 欄位順序：日期, 成交股數, 成交金額, 開盤價, 最高價, 最低價, 收盤價, 漲跌價差, 成交筆數
-  const last = rows[rows.length - 1];
-  const close = parseFloat(last[6].replace(/,/g, ''));
-  const open  = parseFloat(last[3].replace(/,/g, ''));
-  const high  = parseFloat(last[4].replace(/,/g, ''));
-  const low   = parseFloat(last[5].replace(/,/g, ''));
-  const change = parseFloat(last[7].replace(/,/g, '')) || 0;
-  const prevClose = close - change;
-
-  return {
-    code,
-    name: data.title?.split(' ')[1] || code,
-    close,
-    open,
-    high,
-    low,
-    volume: null,
-    prevClose,
-    change: +change.toFixed(2),
-    changePct: prevClose > 0 ? +(change / prevClose * 100).toFixed(2) : 0,
-    date: last[0],
-    source: 'twse_history',
+    market: s.ex || null,
+    source: 'twse_mis',
   };
 }

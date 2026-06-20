@@ -1,159 +1,126 @@
 /**
  * api/history.js
  * 個股歷史日K資料 API
- * 資料來源：FinMind（需要 Token）
+ * 資料來源：TWSE STOCK_DAY（上市）／TPEx tradingStock（上櫃），免 Token
  *
- * 呼叫方式：
- *   GET /api/history?code=2330&start=2026-01-02&end=2026-03-27
- *   GET /api/history?code=2330&start=2021-01-01   (不傳 end 預設今天)
+ * 呼叫：
+ *   GET /api/history?code=2330&start=2026-01-02&end=2026-06-18
+ *   GET /api/history?code=2330&start=2026-01-02   (end 預設今天)
  *
- * 回傳格式：
- *   {
- *     code, name,
- *     data: [ { date, open, high, low, close, volume, change, changePct }, ... ]
- *   }
+ * 回傳：
+ *   { code, name, source, data: [ { date, open, high, low, close, volume }, ... ] }   // 日期升冪
  */
-
-// ── FinMind Token 設定 ─────────────────────────────────────────────
-// 申請地址：https://finmindtrade.com/analysis/#/Finmind_token
-// 申請後填入下方，或設定為 Vercel 環境變數 FINMIND_TOKEN
-// 建議做法：在 Vercel Dashboard → Settings → Environment Variables 加入
-//           FINMIND_TOKEN = your_token_here
-// 免費方案限制：每分鐘 30 次請求，每次最多回傳 1800 筆（約5年日K）
-const FINMIND_TOKEN = process.env.FINMIND_TOKEN || '';
-// ──────────────────────────────────────────────────────────────────
-
-const FINMIND_BASE = 'https://api.finmindtrade.com/api/v4/data';
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET');
+  res.setHeader('Cache-Control', 's-maxage=900, stale-while-revalidate=3600');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  const { code, start, end } = req.query;
+  const base = `https://${req.headers.host || 'localhost'}`;
+  const { searchParams } = new URL(req.url, base);
+  const code = (searchParams.get('code') || '').trim();
+  if (!code) return res.status(400).json({ error: '請提供 code 參數' });
 
-  if (!code) {
-    return res.status(400).json({ error: '請提供 code 參數（股票代號）' });
-  }
-
-  // 預設起始日期：2026-01-02（今年年初）
-  const startDate = start || '2026-01-02';
-  // 預設結束日期：今天
-  const endDate = end || new Date().toISOString().split('T')[0];
-
-  // 如果沒有 Token，回傳說明
-  if (!FINMIND_TOKEN) {
-    return res.status(503).json({
-      error: 'FINMIND_TOKEN 未設定',
-      message: '請至 https://finmindtrade.com 申請 Token，並設定 Vercel 環境變數 FINMIND_TOKEN',
-      // 開發期間回傳假資料供前端測試
-      mock: true,
-      code,
-      data: generateMockHistory(code, startDate, endDate),
-    });
-  }
+  const start = searchParams.get('start') || `${new Date().getFullYear()}-01-02`;
+  const end = searchParams.get('end') || new Date().toISOString().slice(0, 10);
 
   try {
-    const params = new URLSearchParams({
-      dataset: 'TaiwanStockPrice',
-      data_id: code,
-      start_date: startDate,
-      end_date: endDate,
-      token: FINMIND_TOKEN,
-    });
-
-    const resp = await fetch(`${FINMIND_BASE}?${params}`, {
-      headers: { 'User-Agent': 'TWSEDashboard/1.0' },
-    });
-
-    if (!resp.ok) {
-      throw new Error(`FinMind API error: ${resp.status}`);
+    const months = monthList(start, end);
+    // 並行抓各月，單月失敗不影響其他月
+    const settled = await Promise.allSettled(months.map((ym) => fetchMonth(code, ym)));
+    let rows = [];
+    let name = code;
+    for (const r of settled) {
+      if (r.status === 'fulfilled' && r.value) {
+        if (r.value.name) name = r.value.name;
+        rows = rows.concat(r.value.rows);
+      }
     }
+    // 去重、過濾區間、升冪
+    const seen = new Set();
+    rows = rows
+      .filter((d) => d.date >= start && d.date <= end)
+      .filter((d) => (seen.has(d.date) ? false : (seen.add(d.date), true)))
+      .sort((a, b) => (a.date < b.date ? -1 : 1));
 
-    const json = await resp.json();
-
-    if (json.status !== 200) {
-      throw new Error(`FinMind error: ${json.msg || 'Unknown error'}`);
-    }
-
-    // 整理資料格式
-    const rows = json.data || [];
-    const processed = rows.map((r, i) => {
-      const prevClose = i > 0 ? rows[i-1].close : r.open;
-      const change = r.close - prevClose;
-      return {
-        date: r.date,
-        open: r.open,
-        high: r.max,
-        low: r.min,
-        close: r.close,
-        volume: r.Trading_Volume,
-        change: +change.toFixed(2),
-        changePct: prevClose > 0 ? +(change / prevClose * 100).toFixed(2) : 0,
-      };
-    });
-
-    return res.status(200).json({
-      code,
-      name: rows[0]?.stock_id || code,
-      start: startDate,
-      end: endDate,
-      count: processed.length,
-      data: processed,
-    });
-
+    return res.status(200).json({ code, name, source: 'twse_stock_day', data: rows });
   } catch (err) {
     console.error('[history.js] Error:', err.message);
-    return res.status(500).json({ error: err.message });
+    return res.status(200).json({ code, name: code, source: 'error', data: [], error: err.message });
   }
 }
 
-/**
- * 無 Token 時的假資料產生器（開發/Demo 用）
- * 用於前端 UI 測試，讓儀表板在沒有 Token 時也能正常顯示
- */
-function generateMockHistory(code, startDate, endDate) {
-  const start = new Date(startDate);
-  const end = new Date(endDate);
+/** 產生 start~end 之間每個月的 'YYYYMM' 清單 */
+function monthList(start, end) {
+  const out = [];
+  let [y, m] = [parseInt(start.slice(0, 4)), parseInt(start.slice(5, 7))];
+  const ey = parseInt(end.slice(0, 4));
+  const em = parseInt(end.slice(5, 7));
+  while (y < ey || (y === ey && m <= em)) {
+    out.push(`${y}${String(m).padStart(2, '0')}`);
+    m += 1;
+    if (m > 12) { m = 1; y += 1; }
+  }
+  return out;
+}
 
-  // 各股票的近似基準價（Demo 用）
-  const basePrices = {
-    '2330': 980, '2454': 1200, '2317': 220, '2882': 60,
-    '2881': 85, '2886': 39, '2892': 30, '2308': 350,
-    '2412': 126, '2357': 475, '2379': 580, '2345': 265,
-    '2891': 29, '2002': 27, '6669': 1500, '1301': 83,
-  };
-  const base = basePrices[code] || 100;
+function n(v) {
+  const x = parseFloat(String(v).replace(/,/g, ''));
+  return Number.isFinite(x) ? x : null;
+}
 
-  const rows = [];
-  let price = base * 0.92; // 從年初較低點開始
-  const current = new Date(start);
+/** ROC 日期 "114/06/18" 或 "115/06/18" → "2026-06-18" */
+function rocToISO(s) {
+  const m = String(s).trim().match(/(\d+)\/(\d+)\/(\d+)/);
+  if (!m) return null;
+  const y = parseInt(m[1]) + 1911;
+  return `${y}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`;
+}
 
-  while (current <= end) {
-    const dow = current.getDay();
-    if (dow !== 0 && dow !== 6) { // 跳過週末
-      const change = (Math.random() - 0.47) * base * 0.022;
-      price = Math.max(base * 0.6, Math.min(base * 1.5, price + change));
-      const open  = +(price * (1 + (Math.random() - 0.5) * 0.01)).toFixed(1);
-      const high  = +(Math.max(open, price) * (1 + Math.random() * 0.008)).toFixed(1);
-      const low   = +(Math.min(open, price) * (1 - Math.random() * 0.008)).toFixed(1);
-      const close = +price.toFixed(1);
-      const prevClose = rows.length > 0 ? rows[rows.length-1].close : base;
-      rows.push({
-        date: current.toISOString().split('T')[0],
-        open, high, low, close,
-        volume: Math.floor(Math.random() * 50000 + 5000),
-        change: +(close - prevClose).toFixed(2),
-        changePct: +((close - prevClose) / prevClose * 100).toFixed(2),
-      });
+function mapRows(dataRows) {
+  // 欄位：日期, 成交股數, 成交金額, 開盤, 最高, 最低, 收盤, 漲跌, 筆數
+  const out = [];
+  for (const r of dataRows) {
+    const date = rocToISO(r[0]);
+    const close = n(r[6]);
+    if (!date || close == null) continue;
+    out.push({ date, open: n(r[3]), high: n(r[4]), low: n(r[5]), close, volume: n(r[1]) });
+  }
+  return out;
+}
+
+/** 抓單月：先試上市 STOCK_DAY，無資料再試上櫃 TPEx */
+async function fetchMonth(code, ym) {
+  const ua = { 'User-Agent': 'Mozilla/5.0 (compatible; TWSEDashboard/2.0)' };
+
+  // 上市
+  try {
+    const url = `https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY?stockNo=${code}&date=${ym}01&response=json`;
+    const resp = await fetch(url, { headers: ua });
+    if (resp.ok) {
+      const j = await resp.json();
+      if (j.stat === 'OK' && Array.isArray(j.data) && j.data.length) {
+        const nm = (j.title || '').split(' ').filter(Boolean)[1] || '';
+        return { name: nm, rows: mapRows(j.data) };
+      }
     }
-    current.setDate(current.getDate() + 1);
-  }
+  } catch (e) { /* fall through to OTC */ }
 
-  // 最後一天對齊基準價
-  if (rows.length > 0) {
-    rows[rows.length - 1].close = base;
-  }
+  // 上櫃
+  try {
+    const y = ym.slice(0, 4), mm = ym.slice(4, 6);
+    const url = `https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock?code=${code}&date=${y}/${mm}/01&response=json`;
+    const resp = await fetch(url, { headers: ua });
+    if (resp.ok) {
+      const j = await resp.json();
+      const tbl = j.tables && j.tables[0];
+      if (tbl && Array.isArray(tbl.data) && tbl.data.length) {
+        const nm = (tbl.subtitle || '').split(' ').filter(Boolean)[1] || '';
+        return { name: nm, rows: mapRows(tbl.data) };
+      }
+    }
+  } catch (e) { /* ignore */ }
 
-  return rows;
+  return { name: '', rows: [] };
 }
