@@ -394,27 +394,27 @@ canvas.spark{display:block;}
     <div class="index-row">
       <div class="index-card up" style="animation-delay:.05s">
         <div class="index-name">加權指數 TAIEX</div>
-        <div class="index-value">42,268</div>
-        <div class="index-change up">▲ 899.76 &nbsp;+2.18%</div>
-        <div class="index-vol">成交量 11,903 億</div>
+        <div class="index-value" id="iv-t00">42,268</div>
+        <div class="index-change up" id="ich-t00">▲ 899.76 &nbsp;+2.18%</div>
+        <div class="index-vol" id="ivol-t00">成交量 11,903 億</div>
       </div>
       <div class="index-card down" style="animation-delay:.1s">
         <div class="index-name">電子類指數</div>
-        <div class="index-value">2,246</div>
-        <div class="index-change up">▲ 38.45 &nbsp;+1.74%</div>
-        <div class="index-vol">漲跌比 685 / 248</div>
+        <div class="index-value" id="iv-t13">2,246</div>
+        <div class="index-change up" id="ich-t13">▲ 38.45 &nbsp;+1.74%</div>
+        <div class="index-vol" id="ivol-t13">漲跌比 685 / 248</div>
       </div>
       <div class="index-card up" style="animation-delay:.15s">
         <div class="index-name">金融類指數</div>
-        <div class="index-value">2,318</div>
-        <div class="index-change up">▲ 22.18 &nbsp;+0.97%</div>
-        <div class="index-vol">漲跌比 32 / 6</div>
+        <div class="index-value" id="iv-t17">2,318</div>
+        <div class="index-change up" id="ich-t17">▲ 22.18 &nbsp;+0.97%</div>
+        <div class="index-vol" id="ivol-t17">漲跌比 32 / 6</div>
       </div>
       <div class="index-card up" style="animation-delay:.2s">
-        <div class="index-name">傳產類指數</div>
-        <div class="index-value">956</div>
-        <div class="index-change up">▲ 8.12 &nbsp;+0.86%</div>
-        <div class="index-vol">漲跌比 218 / 132</div>
+        <div class="index-name">櫃買指數 OTC</div>
+        <div class="index-value" id="iv-o00">956</div>
+        <div class="index-change up" id="ich-o00">▲ 8.12 &nbsp;+0.86%</div>
+        <div class="index-vol" id="ivol-o00">漲跌比 218 / 132</div>
       </div>
     </div>
 
@@ -1751,12 +1751,48 @@ initDashboard();
 initScreener();
 updateWLBadge();
 
+// ── 大盤指數：即時抓取並填入卡片 ─────────────────────────────────
+async function fetchLiveIndices() {
+  try {
+    const res = await fetch(`${API_BASE}/api/price?codes=t00,t13,t17,o00`);
+    if (!res.ok) throw new Error('index API error');
+    const data = await res.json();
+    if (!Array.isArray(data)) return;
+    data.forEach(s => {
+      const v = document.getElementById('iv-' + s.code);
+      if (!v || s.close == null) return;
+      const up  = (s.changePct ?? 0) >= 0;
+      const chg = s.change ?? 0;
+      v.textContent = s.close.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const c = document.getElementById('ich-' + s.code);
+      if (c) {
+        c.className = 'index-change ' + (up ? 'up' : 'down');
+        c.innerHTML = `${up ? '▲' : '▼'} ${Math.abs(chg).toFixed(2)} &nbsp;${up ? '+' : '-'}${Math.abs(s.changePct ?? 0).toFixed(2)}%`;
+      }
+      const card = v.closest('.index-card');
+      if (card) card.className = 'index-card ' + (up ? 'up' : 'down');
+      const vol = document.getElementById('ivol-' + s.code);
+      if (vol) {
+        const d = s.date ? `${s.date.slice(4,6)}/${s.date.slice(6,8)}` : '';
+        vol.textContent = d ? `更新 ${d}` : '';
+      }
+    });
+    console.log('[API] Live indices loaded');
+  } catch (err) {
+    console.warn('[API] index fetch failed, keep static:', err.message);
+  }
+}
+
 // Load live prices after UI is ready (non-blocking)
 fetchLivePrices().then(priceMap => {
   if (priceMap) {
     console.log('[API] Dashboard updated with live prices');
   }
 });
+
+// 大盤指數即時：開頁載入 + 每 60 秒更新（盤中跟著快取走）
+fetchLiveIndices();
+setInterval(fetchLiveIndices, 60000);
 </script>
 </body>
 </html>
