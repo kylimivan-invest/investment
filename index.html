@@ -907,8 +907,30 @@ function dSelectStock(code, btn) {
 }
 
 function dDrawChart(code, period) {
-  const s = D_STOCKS[code];
-  const prices = s['prices'+period];
+  // 先用既有(或合成)資料畫出，避免空白
+  const cached = D_STOCKS[code] && D_STOCKS[code]['real'+period];
+  const placeholder = (D_STOCKS[code] && D_STOCKS[code]['prices'+period]) || [];
+  renderChartSVG(code, period, cached || placeholder);
+  if (cached) return;
+  // 向 TWSE 抓真實歷史(免token)
+  const daysMap = { '1M':32, '3M':95, '6M':190, '1Y':375 };
+  const end = new Date().toISOString().slice(0,10);
+  const start = new Date(Date.now() - (daysMap[period]||32)*86400000).toISOString().slice(0,10);
+  fetch(`${API_BASE}/api/history?code=${code}&start=${start}&end=${end}`)
+    .then(r => r.ok ? r.json() : null)
+    .then(j => {
+      if (!j || !Array.isArray(j.data) || j.data.length < 2) return;
+      const prices = j.data.map(d => d.close);
+      if (!D_STOCKS[code]) D_STOCKS[code] = { name: j.name || code };
+      D_STOCKS[code]['real'+period] = prices;
+      if (dCurrentStock === code && dCurrentPeriod === period) renderChartSVG(code, period, prices);
+    })
+    .catch(() => {});
+}
+
+function renderChartSVG(code, period, prices) {
+  const s = D_STOCKS[code] || { name: code };
+  if (!prices || !prices.length) return;
   const svg = document.getElementById('d-chart');
   const W=760, H=200, pt=14, pb=26, pl=8, pr=40;
   const cW=W-pl-pr, cH=H-pt-pb;
@@ -1057,32 +1079,45 @@ async function runScreen() {
       const data = await res.json();
       universe = data.stocks;
       _screenerCache = universe;
-      if (hint) hint.textContent = `✅ 載入 ${universe.length} 檔，補充即時股價中…`;
+      if (hint) hint.textContent = `✅ 載入 ${universe.length} 檔，套用即時股價中…`;
+      // 先用「收盤 ÷ 本益比」精確還原 EPS，並記錄基準值
+      universe.forEach(s => {
+        s._baseClose = s.close;
+        s._basePE = s.pe;
+        s._baseYield = s.yield_;
+        if (s.pe > 0 && s.close > 0) s.eps = +(s.close / s.pe).toFixed(2);
+      });
       try {
-        const codes = universe.slice(0,50).map(s=>s.code).join(',');
-        const pc = new AbortController();
-        const pt = setTimeout(() => pc.abort(), 5000);
-        const pr = await fetch(`${API_BASE}/api/price?codes=${codes}`, { signal: pc.signal });
-        clearTimeout(pt);
-        if (pr.ok) {
-          const prices = await pr.json();
-          if (Array.isArray(prices)) {
-            const pm = {};
-            prices.forEach(p => { if(p.code) pm[p.code]=p; });
-            universe.forEach(s => {
-              if (pm[s.code]) {
-                s.close    = pm[s.code].close    ?? s.close;
-                s.chg1w    = pm[s.code].changePct ?? 0;
-                s.chg1m    = pm[s.code].changePct ?? 0;
-                s.w52hi    = pm[s.code].high      ?? 0;
-                s.w52lo    = pm[s.code].low       ?? 0;
-              }
-            });
-          }
-        }
+        // 全universe分批抓即時價(並行)
+        const all = universe.map(s => s.code);
+        const CH = 120, chunks = [];
+        for (let i = 0; i < all.length; i += CH) chunks.push(all.slice(i, i + CH));
+        const pm = {};
+        await Promise.all(chunks.map(async grp => {
+          try {
+            const pr = await fetch(`${API_BASE}/api/price?codes=${grp.join(',')}`);
+            if (!pr.ok) return;
+            const arr = await pr.json();
+            (Array.isArray(arr) ? arr : [arr]).forEach(p => { if (p && p.code) pm[p.code] = p; });
+          } catch (e) {}
+        }));
+        let liveN = 0;
+        universe.forEach(s => {
+          const lv = pm[s.code];
+          if (!lv || lv.close == null) return;
+          const base = s._baseClose || lv.close;
+          const ratio = base > 0 ? lv.close / base : 1;
+          s.close = lv.close;
+          s.chgPct = lv.changePct ?? 0;
+          // 殖利率與本益比依即時價同步調整(股利/EPS相消，數學精確)
+          if (s._basePE > 0) s.pe = +(s._basePE * ratio).toFixed(1);
+          if (s._baseYield > 0) s.yield_ = +(s._baseYield / ratio).toFixed(2);
+          s._live = true; liveN++;
+        });
+        window._screenerLiveN = liveN;
       } catch(e) { console.warn('[Screener] price enrichment skip:', e.message); }
 
-      if (hint) hint.textContent = `✅ 成功載入 ${universe.length} 檔（${data.updated}）`;
+      if (hint) hint.textContent = `✅ ${universe.length} 檔　|　基本面:${data.updated}　股價:即時(${window._screenerLiveN||0})`;
       console.log(`[Screener] ${universe.length} stocks from ${data.source}`);
     } catch (err) {
       console.warn('[Screener] fallback to static STOCKS:', err.message);
@@ -1790,9 +1825,39 @@ fetchLivePrices().then(priceMap => {
   }
 });
 
-// 大盤指數即時：開頁載入 + 每 60 秒更新（盤中跟著快取走）
+// ── 類股熱區圖：用各類股指數當日漲跌 ───────────────────────────
+const SECTOR_INDEX = [
+  {code:'t24',name:'半導體'},{code:'t28',name:'電子零組件'},{code:'t25',name:'電腦週邊'},{code:'t26',name:'光電'},
+  {code:'t27',name:'通信網路'},{code:'t13',name:'電子(大類)'},{code:'t17',name:'金融保險'},{code:'t10',name:'鋼鐵'},
+  {code:'t15',name:'航運'},{code:'t12',name:'汽車'},{code:'t22',name:'生技醫療'},{code:'t03',name:'塑膠'},
+  {code:'t05',name:'電機機械'},{code:'t02',name:'食品'},{code:'t14',name:'建材營造'},{code:'t18',name:'貿易百貨'}
+];
+async function fetchSectorHeatmap() {
+  try {
+    const codes = SECTOR_INDEX.map(x => x.code).join(',');
+    const res = await fetch(`${API_BASE}/api/price?codes=${codes}`);
+    if (!res.ok) return;
+    const arr = await res.json();
+    if (!Array.isArray(arr)) return;
+    const pm = {}; arr.forEach(p => { if (p && p.code) pm[p.code] = p; });
+    const cells = SECTOR_INDEX.map(x => {
+      const p = pm[x.code]; const pct = (p && p.changePct != null) ? p.changePct : null;
+      if (pct == null) return '';
+      const cls = pct >= 2 ? 'sup' : pct > 0 ? 'up' : pct <= -1 ? 'dn' : 'neu';
+      const tcls = pct > 0 ? 'up-text' : pct < 0 ? 'dn-text' : 'neu-text';
+      return `<div class="hm-cell ${cls}"><div class="hm-sector">${x.name}</div>`+
+             `<div class="hm-pct ${tcls}">${pct>0?'+':''}${pct.toFixed(2)}%</div></div>`;
+    }).filter(Boolean).join('');
+    const el = document.getElementById('d-heatmap');
+    if (el && cells) el.innerHTML = cells;
+    console.log('[API] Sector heatmap loaded');
+  } catch (err) { console.warn('[API] sector heatmap failed:', err.message); }
+}
+
+// 大盤指數 + 類股熱區即時：開頁載入 + 每 60 秒更新
 fetchLiveIndices();
-setInterval(fetchLiveIndices, 60000);
+fetchSectorHeatmap();
+setInterval(() => { fetchLiveIndices(); fetchSectorHeatmap(); }, 60000);
 </script>
 </body>
 </html>
